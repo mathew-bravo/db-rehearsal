@@ -46,12 +46,41 @@ struct PendingCapturedQuery {
     sql: String,
 }
 
+/// Configures which captured queries should be yielded by the streaming filter layer.
+#[derive(Debug, Default)]
+pub struct CapturedQueryFilter {
+    pub allowed_query_types: Option<Vec<QueryType>>,
+    pub connection_id: Option<u64>,
+    pub skip_noisy_queries: bool,
+}
+
+impl CapturedQueryFilter {
+    fn matches(&self, query: &CapturedQuery) -> bool {
+        self
+            .allowed_query_types
+            .as_ref()
+            .map(|allowed_query_types| allowed_query_types.contains(&query.query_type))
+            .unwrap_or(true)
+            && self
+                .connection_id
+                .map(|expected_connection_id| query.connection_id == expected_connection_id)
+                .unwrap_or(true)
+            && (!self.skip_noisy_queries || !is_noisy_query(&query.sql))
+    }
+}
+
 /// Streams captured queries from a general log reader without buffering the full file.
 pub struct CapturedQueryStream<R: BufRead> {
     lines: Lines<R>,
     current_query: Option<PendingCapturedQuery>,
     pending_blank_lines: usize,
     finished: bool,
+}
+
+/// Streams captured queries that match a filter without buffering the full file.
+pub struct FilteredCapturedQueryStream<I> {
+    inner: I,
+    filter: CapturedQueryFilter,
 }
 
 impl<R: BufRead> CapturedQueryStream<R> {
@@ -62,6 +91,10 @@ impl<R: BufRead> CapturedQueryStream<R> {
             pending_blank_lines: 0,
             finished: false,
         }
+    }
+
+    pub fn with_filter(self, filter: CapturedQueryFilter) -> FilteredCapturedQueryStream<Self> {
+        FilteredCapturedQueryStream::new(self, filter)
     }
 
     fn process_line(&mut self, line: &str) -> Option<CapturedQuery> {
@@ -127,6 +160,34 @@ impl<R: BufRead> Iterator for CapturedQueryStream<R> {
 }
 
 impl<R: BufRead> FusedIterator for CapturedQueryStream<R> {}
+
+impl<I> FilteredCapturedQueryStream<I> {
+    pub fn new(inner: I, filter: CapturedQueryFilter) -> Self {
+        Self { inner, filter }
+    }
+}
+
+impl<I> Iterator for FilteredCapturedQueryStream<I>
+where
+    I: Iterator<Item = Result<CapturedQuery, Error>>,
+{
+    type Item = Result<CapturedQuery, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(query) if self.filter.matches(&query) => return Some(Ok(query)),
+                Ok(_) => continue,
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
+impl<I> FusedIterator for FilteredCapturedQueryStream<I> where
+    I: FusedIterator<Item = Result<CapturedQuery, Error>>
+{
+}
 
 // TODO: Add a structured warning/error path so skipped lines are observable instead of silently ignored.
 
@@ -229,11 +290,7 @@ fn classify_query_type(command_type: &CommandType, sql: &str) -> QueryType {
         _ => {}
     }
 
-    let keywords = sql
-        .split_whitespace()
-        .take(2)
-        .map(normalize_keyword)
-        .collect::<Vec<_>>();
+    let keywords = normalized_leading_keywords(sql, 2);
 
     match keywords.as_slice() {
         [first, second] if first == "DROP" && second == "PREPARE" => {
@@ -250,13 +307,29 @@ fn classify_query_type(command_type: &CommandType, sql: &str) -> QueryType {
         "UPDATE" => QueryType::Update,
         "DELETE" => QueryType::Delete,
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" => QueryType::DDL,
-        "SET" | "USE" | "SHOW" | "CALL" | "DO" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK"
-        | "LOCK" | "UNLOCK" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "GRANT" | "REVOKE" => {
+        "SET" | "USE" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "CALL" | "DO"
+        | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "LOCK" | "UNLOCK" | "PREPARE"
+        | "EXECUTE" | "DEALLOCATE" | "GRANT" | "REVOKE" => {
             QueryType::Administrative
         }
         "" => QueryType::Other,
         _ => QueryType::Other,
     }
+}
+
+fn is_noisy_query(sql: &str) -> bool {
+    match normalized_leading_keywords(sql, 2).as_slice() {
+        [first, second] if first == "SET" && second == "NAMES" => true,
+        [first, second] if first == "SELECT" && second == "VERSION" => true,
+        _ => false,
+    }
+}
+
+fn normalized_leading_keywords(sql: &str, count: usize) -> Vec<String> {
+    sql.split_whitespace()
+        .take(count)
+        .map(normalize_keyword)
+        .collect()
 }
 
 /// Normalizes a keyword by removing non-alphanumeric characters and converting to uppercase.
@@ -277,28 +350,19 @@ mod tests {
             .unwrap()
     }
 
-    // This models the intended future filter layer behavior without adding it to production yet.
-    fn apply_future_filter(
-        queries: impl IntoIterator<Item = CapturedQuery>,
-        allowed_query_types: &[QueryType],
+    fn capture_filtered_fixture(
+        fixture: &str,
+        allowed_query_types: Vec<QueryType>,
         connection_id: Option<u64>,
     ) -> Vec<CapturedQuery> {
-        queries
-            .into_iter()
-            .filter(|query| allowed_query_types.contains(&query.query_type))
-            .filter(|query| !is_future_noise_query(query))
-            .filter(|query| {
-                connection_id
-                    .map(|expected_connection_id| query.connection_id == expected_connection_id)
-                    .unwrap_or(true)
+        CapturedQueryStream::new(Cursor::new(fixture))
+            .with_filter(CapturedQueryFilter {
+                allowed_query_types: Some(allowed_query_types),
+                connection_id,
+                skip_noisy_queries: true,
             })
-            .collect()
-    }
-
-    fn is_future_noise_query(query: &CapturedQuery) -> bool {
-        let normalized_sql = query.sql.to_ascii_uppercase();
-
-        normalized_sql.starts_with("SET NAMES ") || normalized_sql.starts_with("SELECT @@VERSION")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     }
 
     fn sqls(queries: &[CapturedQuery]) -> Vec<&str> {
@@ -340,12 +404,95 @@ mod tests {
             .unwrap();
         assert!(quit_query.sql.is_empty());
         assert_eq!(quit_query.query_type, QueryType::Administrative);
+
+        let describe_query = queries
+            .iter()
+            .find(|query| query.sql == "DESCRIBE users")
+            .unwrap();
+        assert_eq!(describe_query.query_type, QueryType::Administrative);
     }
 
     #[test]
-    fn classifies_drop_prepare_as_administrative() {
+    fn test_capture_mysql_8_general_log() {
+        let path = Path::new("test-data/general_80.log");
+        let queries = capture_general_log(path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(queries.len(), 18_424);
+
+        let first_query = &queries[0];
+        assert_eq!(
+            first_query.timestamp,
+            DateTime::parse_from_rfc3339("2026-03-06T21:41:23.470247Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(first_query.connection_id, 6);
+        assert_eq!(first_query.command_type, CommandType::Query);
+        assert_eq!(first_query.sql, "USE mysql;");
+        assert_eq!(first_query.query_type, QueryType::Administrative);
+
+        let copyright_query = queries
+            .iter()
+            .find(|query| query.sql.starts_with("-- Copyright (c) 2007, 2025, Oracle"))
+            .unwrap();
+        assert!(copyright_query.sql.contains("-- This program is free software;"));
+        assert!(copyright_query.sql.contains("set @have_innodb="));
+
+        let prepare_user_query = queries
+            .iter()
+            .find(|query| {
+                query.command_type == CommandType::Prepare
+                    && query.sql.starts_with("CREATE TABLE IF NOT EXISTS user\n(")
+            })
+            .unwrap();
+        assert_eq!(prepare_user_query.connection_id, 6);
+        assert_eq!(prepare_user_query.query_type, QueryType::DDL);
+        assert!(prepare_user_query.sql.contains("User_attributes JSON DEFAULT NULL"));
+
+        let repeated_header_execute = queries
+            .iter()
+            .find(|query| {
+                query.connection_id == 0
+                    && query.command_type == CommandType::Execute
+                    && query
+                        .sql
+                        .starts_with("CREATE TABLE performance_schema.innodb_redo_log_files(")
+            })
+            .unwrap();
+        assert_eq!(repeated_header_execute.query_type, QueryType::DDL);
+
+        let last_query = queries.last().unwrap();
+        assert_eq!(
+            last_query.timestamp,
+            DateTime::parse_from_rfc3339("2026-03-06T21:43:06.842038Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(last_query.connection_id, 10);
+        assert_eq!(last_query.command_type, CommandType::Quit);
+        assert!(last_query.sql.is_empty());
+        assert_eq!(last_query.query_type, QueryType::Administrative);
+    }
+
+    #[test]
+    fn classifies_admin_statements() {
         assert_eq!(
             classify_query_type(&CommandType::Query, "DROP PREPARE stmt;"),
+            QueryType::Administrative
+        );
+        assert_eq!(
+            classify_query_type(&CommandType::Query, "DESCRIBE users;"),
+            QueryType::Administrative
+        );
+        assert_eq!(
+            classify_query_type(&CommandType::Query, "DESC users;"),
+            QueryType::Administrative
+        );
+        assert_eq!(
+            classify_query_type(&CommandType::Query, "EXPLAIN SELECT * FROM users;"),
             QueryType::Administrative
         );
         assert_eq!(
@@ -404,7 +551,7 @@ mod tests {
         ];
 
         let filtered_without_connection_scope =
-            apply_future_filter(capture_fixture(fixture), &allowed_query_types, None);
+            capture_filtered_fixture(fixture, allowed_query_types.into(), None);
         assert_eq!(
             sqls(&filtered_without_connection_scope),
             vec![
@@ -415,7 +562,11 @@ mod tests {
         );
 
         let filtered_for_connection_one =
-            apply_future_filter(capture_fixture(fixture), &allowed_query_types, Some(1));
+            capture_filtered_fixture(
+                fixture,
+                vec![QueryType::Select, QueryType::DDL, QueryType::Administrative],
+                Some(1),
+            );
         assert_eq!(
             sqls(&filtered_for_connection_one),
             vec!["SELECT * FROM users;", "CREATE TABLE widgets (id INT);",]
@@ -435,5 +586,20 @@ mod tests {
         assert_eq!(queries.len(), 2);
         assert_eq!(queries[0].sql, "SELECT 1");
         assert_eq!(queries[1].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn surfaces_non_utf8_binary_content_as_invalid_data() {
+        let fixture = b"2026-03-06T18:26:16.879568Z\t1 Query\tSELECT 1;\n\
+2026-03-06T18:26:16.880000Z\t1 Query\t\xff\xfe\n";
+        let mut queries = CapturedQueryStream::new(Cursor::new(&fixture[..]));
+
+        let error = queries.next().unwrap().unwrap_err();
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("expected non-UTF8 content to surface as an io::Error");
+
+        assert_eq!(io_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(queries.next().is_none());
     }
 }
