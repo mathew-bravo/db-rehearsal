@@ -1,3 +1,4 @@
 /target
 .cargo-home
 .cursor
+test-data
