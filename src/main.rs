@@ -1,3 +1,5 @@
+mod capture;
+
 use clap::{ArgAction, Args, Parser};
 
 #[derive(Debug, Parser)]
